@@ -1,10 +1,13 @@
+import ast
+from typing import Dict, Tuple, List, Union, Optional
 from pathlib import Path
 import re
+
 import pdb
 
 
 DEBUG_LOC = "packages/xnu/"
-RELEASE_LOC = " 수정 필 요 **"
+RELEASE_LOC = "C:/Users/오현규/OneDrive/내 문서/BestOFtheBest/___프로젝트/apple_m3_디버깅해보든가/Send Anywhere (2025-09-10 04-47-36)/m3_assembly/니m1/packages/xnu"
 
 # 헤더파일 경로 모두 추출
 def HeaderFileLoc_extract() -> list:
@@ -14,11 +17,17 @@ def HeaderFileLoc_extract() -> list:
 
     # pathlib.Path.rglob('*')는 심볼릭 링크를 따라가지 않음(무한 루프 방지에 유리)
     for p in root.rglob("*"):
-        if not p.is_file():
+        try :
+            if not p.is_file():
+                continue
+        except OSError :
             continue
-        
+
         s = str(p.relative_to(root).as_posix())
+        '''
         if '.h' in s and not 'test' in s:
+            results.append(str(p.as_posix()))'''
+        if not 'test' in s and ('.h' in s or '.c' in s):
             results.append(str(p.as_posix()))
 
     ''' Debug
@@ -361,7 +370,8 @@ def remove_comments(code: str) -> str:
     return ''.join(result)
 
 
-def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list[str], list[str], list[tuple[str, str | None]]]:
+# def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list[str], list[str], list[tuple[str, str | None]]]:
+def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list[str], list[str], dict]:
     """
     주어진 C 헤더파일 코드(header_code)와 사전에 정의된 매크로 목록(defined_macros)을 입력으로 받아,
     - 함수 프로토타입 리스트,
@@ -374,7 +384,10 @@ def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list
     # 2. 조건부 컴파일 처리: 유효하지 않은 코드 블록은 제거
     active_defines = set(defined_macros)  # 현재 정의된 매크로 집합 (초기값은 입력 리스트)
     active_code_lines: list[str] = []     # 조건을 만족하여 살아남은 코드 줄들
-    out_macros: list[tuple[str, str | None]] = []  # 추출된 매크로 상수 리스트
+    # out_macros: list[tuple[str, str | None]] = []  # 추출된 매크로 상수 리스트
+    # out_macros: list[list[str, str | None]] = []  # 추출된 매크로 상수 리스트
+    out_macros = dict()
+
 
     # 스택을 이용하여 조건문 중첩 처리
     condition_stack: list[bool] = []   # 각 조건부 블록의 현재 활성 상태
@@ -494,7 +507,9 @@ def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list
                         # tokens[2]에 매크로 값 전체가 들어있음
                         val_str = tokens[2].strip()
                         value = val_str if val_str != "" else None
-                    out_macros.append((name, value))
+
+                    # out_macros.append([name, value])
+                    out_macros[name] = value
                     active_defines.add(name)  # 매크로를 정의된 집합에 추가
             continue  # 매크로 정의 행 자체는 출력 리스트에 추가하지 않음
 
@@ -645,7 +660,281 @@ def parse_header_code(header_code: str, defined_macros: list[str]) -> tuple[list
     return func_prototypes, structs, out_macros
 
 
-if __name__ == "__main__":
-    headers = HeaderFileLoc_extract()
+def Delete_for_Pretty(content):
+    MAX_FS = len(content)
+    i = 0
+    FIXED = ''
+    while i < MAX_FS:
+        if content[i] == '\n' and \
+            i + 2 < MAX_FS and \
+            content[i+1] == '\t' and \
+            content[i+2] == '\n':
+            i += 1
+        else :
+            FIXED += content[i]
+        i += 1
+    return FIXED
 
-    print(headers)
+
+def replace_bracket_constants(code, const_map):
+    """
+    code: C 구조체 등 원본 문자열
+    const_map: {'DYLD_AOT_IMAGE_KEY_SIZE': 32, 'STACKSHOT_IO_NUM_PRIORITIES': 5, ...}
+    return: (치환된 코드, 치환 실패한 상수 리스트)
+    """
+    BRACKET_CONST_PATTERN = re.compile(r"\[\s*(?P<name>[A-Z][A-Z0-9_]*)\s*\]")
+    unresolved = []
+
+    def _sub(m: re.Match) -> str:
+        name = m.group("name")
+        val = const_map.get(name, None)
+        if val is None:
+            # 치환 실패 → 기록하고 원문 유지
+            unresolved.append(name)
+            return m.group(0)
+        # 숫자로 치환
+        try:
+            # val이 int가 아니더라도 숫자 문자열이면 int로 변환 시도
+            ival = int(val)
+            return f"[{ival}]"
+        except (TypeError, ValueError):
+            unresolved.append(name)
+            return m.group(0)
+
+    new_code = BRACKET_CONST_PATTERN.sub(_sub, code)
+    # 중복 보고 제거
+    unresolved = sorted(set(unresolved))
+    return new_code, unresolved
+
+
+def Find_and_insert_macro_into_struct(code, macros):
+    # 1. 모든 MACRO key 값을 숫자 MACRO value 값으로 연결
+    result_mapping_1 = {}
+    for name in macros:
+        result_mapping_1[name] = resolve_macro(name, macros)
+    result_mapping_2 = dict()
+    for _1 in result_mapping_1.keys():
+        if type(result_mapping_1[_1]) == type(10):
+            result_mapping_2[_1] = str(result_mapping_1[_1])
+    
+    return replace_bracket_constants(code, result_mapping_1)
+
+
+
+def resolve_macro(key, macros, visited=None):
+    """
+    주어진 매크로 key의 최종 숫자 값을 재귀적으로 찾아 반환합니다.
+    숫자로 변환되지 않으면 None을 반환합니다.
+    """
+    if visited is None:
+        visited = set()
+    # 이미 방문한 매크로를 다시 만나면 순환 참조이므로 None 반환
+    if key in visited:
+        return None
+    visited.add(key)
+    # 딕셔너리에서 매크로의 값 가져오기
+    value = macros.get(key)
+    if value is None:
+        # 정의되지 않은 매크로인 경우 None 반환
+        return None
+    # 혹시 모를 문자열 양쪽 공백 제거
+    if isinstance(value, str):
+        value = value.strip()
+    # value가 숫자 형식이라면 정수로 변환하여 반환
+    try:
+        return int(value)
+    except ValueError:
+        # 숫자로 변환할 수 없으면 value를 매크로로 보고 재귀 처리
+        return resolve_macro(value, macros, visited)
+
+
+# 1) '[]' 안의 상수 토큰 탐지 (대문자/숫자/언더스코어)
+BRACKET_CONST_PATTERN = re.compile(r"\[\s*(?P<name>[A-Z][A-Z0-9_]*)\s*\]")
+
+# -------- 매크로 표현식 전처리 유틸 --------
+
+# C 정수 리터럴 접미사 제거: 48u, 0xFFUL, 10ULL 등
+_NUM_SUFFIX_RE = re.compile(r"""
+    (?P<num>
+        (?:0[xX][0-9a-fA-F]+)     # hex
+        |(?:0[bB][01]+)           # bin
+        |(?:0[0-7]+)              # oct (선행 0)
+        |(?:\d+)                  # dec
+    )
+    (?P<suffix>[uUlL]+)?          # U, L 조합 접미사
+""", re.VERBOSE)
+
+# C 캐스트 제거: (size_t), (unsigned long), (uint32_t), (const char*), (volatile int) 등
+_CAST_RE = re.compile(r"\(\s*[A-Za-z_][A-Za-z0-9_\s\*\s]*\s*\)")
+
+# 식별자 토큰
+_IDENT_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+
+def _strip_casts(expr: str) -> str:
+    # (type) 캐스트를 통째로 제거
+    while True:
+        new = _CAST_RE.sub("", expr)
+        if new == expr:
+            return expr
+        expr = new
+
+def _strip_num_suffixes(expr: str) -> str:
+    # 48u -> 48, 0xFFUL -> 0xFF
+    def repl(m: re.Match) -> str:
+        return m.group("num")
+    return _NUM_SUFFIX_RE.sub(repl, expr)
+
+def _c_to_python_expr(expr: str) -> str:
+    # C 스타일을 파이썬 정수연산으로 가볍게 보정
+    expr = _strip_casts(expr)
+    expr = _strip_num_suffixes(expr)
+    # C의 정수 나눗셈을 위해 '/' -> '//' (주의: 실수 리터럴 미지원 가정)
+    expr = expr.replace("/", "//")
+    return expr
+
+# -------- 안전한 AST 평가기 --------
+
+_ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Mod,
+                   ast.LShift, ast.RShift, ast.BitOr, ast.BitAnd, ast.BitXor)
+_ALLOWED_UNARYOPS = (ast.UAdd, ast.USub, ast.Invert)
+
+def _safe_eval_ast(node: ast.AST) -> int:
+    if isinstance(node, ast.Expression):
+        return _safe_eval_ast(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, int):
+            return node.value
+        raise ValueError("정수가 아닌 상수는 허용되지 않습니다.")
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, _ALLOWED_UNARYOPS):
+        val = _safe_eval_ast(node.operand)
+        if isinstance(node.op, ast.UAdd):
+            return +val
+        if isinstance(node.op, ast.USub):
+            return -val
+        if isinstance(node.op, ast.Invert):
+            return ~val
+    if isinstance(node, ast.BinOp) and isinstance(node.op, _ALLOWED_BINOPS):
+        left = _safe_eval_ast(node.left)
+        right = _safe_eval_ast(node.right)
+        if isinstance(node.op, ast.Add): return left + right
+        if isinstance(node.op, ast.Sub): return left - right
+        if isinstance(node.op, ast.Mult): return left * right
+        if isinstance(node.op, ast.FloorDiv): return left // right
+        if isinstance(node.op, ast.Mod): return left % right
+        if isinstance(node.op, ast.LShift): return left << right
+        if isinstance(node.op, ast.RShift): return left >> right
+        if isinstance(node.op, ast.BitOr): return left | right
+        if isinstance(node.op, ast.BitAnd): return left & right
+        if isinstance(node.op, ast.BitXor): return left ^ right
+    # 괄호(Paren)는 Expression/노드 구조상 별도 처리 불필요
+    raise ValueError(f"허용되지 않은 AST 노드: {type(node).__name__}")
+
+# -------- 매크로 해석기(재귀) --------
+
+Value = Union[int, str]
+
+def resolve_macro_value(name: str,
+                        defines: Dict[str, Value],
+                        cache: Dict[str, Optional[int]],
+                        visiting: Optional[set] = None) -> Optional[int]:
+    """
+    매크로 'name'의 최종 정수 값을 구함.
+    - defines[name] 이 int면 그대로 반환
+    - 문자열이면:
+        1) 하위 심볼을 재귀 치환
+        2) C식 → 파이썬식 변환 후 안전 AST 평가
+    - 숫자로 환산 불가/사이클/미정의: None
+    """
+    if name in cache:
+        return cache[name]
+
+    if visiting is None:
+        visiting = set()
+    if name in visiting:
+        cache[name] = None
+        return None
+    visiting.add(name)
+
+    val = defines.get(name, None)
+    if val is None:
+        cache[name] = None
+        visiting.remove(name)
+        return None
+
+    # 이미 숫자
+    if isinstance(val, int):
+        cache[name] = val
+        visiting.remove(name)
+        return val
+
+    # 문자열 표현식: 식별자 -> 값 치환
+    expr = str(val)
+
+    # 1) 미리 하위 식별자를 정수로 바꿔 문자열에 대입
+    def _ident_sub(m: re.Match) -> str:
+        ident = m.group(1)
+        # True/False/None 같은 파이썬 키워드가 들어가면 안 됨
+        if ident in ("True", "False", "None"):
+            raise ValueError("예약어는 허용되지 않습니다.")
+        # 자신이거나 숫자 아닌 경우 재귀
+        sub = resolve_macro_value(ident, defines, cache, visiting)
+        if sub is None:
+            # 미정의/숫자화 불가 → 그냥 그대로 두고 이후 평가에서 실패할 수 있음
+            return ident
+        return str(sub)
+
+    expr_with_vals = _IDENT_RE.sub(_ident_sub, expr)
+
+    # 2) C → 파이썬식 변환
+    py_expr = _c_to_python_expr(expr_with_vals)
+
+    # 3) 안전 AST 평가 시도
+    try:
+        node = ast.parse(py_expr, mode="eval")
+        result = _safe_eval_ast(node)
+    except Exception:
+        # 일부 식(예: 아직 남은 미정의 식별자)이면 실패 처리
+        result = None
+
+    cache[name] = result
+    visiting.remove(name)
+    return result
+
+def resolve_all_macros(defines: Dict[str, Value]) -> Dict[str, Optional[int]]:
+    """
+    모든 define에 대해 최종 정수로 평가. 실패 시 None.
+    """
+    cache: Dict[str, Optional[int]] = {}
+    for k in list(defines.keys()):
+        resolve_macro_value(k, defines, cache)
+    return cache
+
+# -------- '[]' 안 상수 치환 --------
+
+def replace_bracket_constants(code: str,
+                              defines: Dict[str, Value]) -> Tuple[str, List[str]]:
+    """
+    code: 구조체 등 원본 문자열
+    defines: 원시 define 맵 (값은 int 또는 문자열 표현식)
+    - 내부적으로 resolve_all_macros로 숫자화 시도 후 치환
+    - 치환 실패 상수 이름 목록 반환
+    """
+    final_map = resolve_all_macros(defines)
+
+    unresolved: List[str] = []
+
+    def _sub(m: re.Match) -> str:
+        name = m.group("name")
+        v = final_map.get(name, None)
+        if isinstance(v, int):
+            return f"[{v}]"
+        unresolved.append(name)
+        return m.group(0)
+
+    out = BRACKET_CONST_PATTERN.sub(_sub, code)
+    return out, sorted(set(unresolved))
+
+
+
+if __name__ == "__main__":
+    macros = 10
